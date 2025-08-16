@@ -18,7 +18,7 @@ MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb+srv://worep38024:eQkzkfjayr
 DB_NAME = os.environ.get('MONGO_DB_NAME', 'filterbot')
 BOT_OWNER_ID = 6797820880  # <--- PUT YOUR TELEGRAM USER ID HERE!
 BOT_DISPLAY_NAME = "FilterBot"
-NEWS_CHANNEL_URL = "https://t.me/Zoro_bots"
+NEWS_CHANNEL_URL = "https://t.me/yourchannel"
 UPI_ID = "8888888888@upi"
 PAID_FILTER_PRICE = 49  # INR
 PAID_FILTER_DURATION = 1  # days (set to your desired duration)
@@ -131,7 +131,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>/setregex &lt;keyword&gt; on/off</b> - Regex (admins or owner for paid)\n"
         "<b>/setsilent &lt;keyword&gt; on/off</b> - Silent mode (admins or owner for paid)\n"
         "<b>/help</b> - Show this help\n\n"
-        f"<i>Paid filters expire in {PAID_FILTER_DURATION} day(s). All filters are used via /filter &lt;keyword&gt; only.</i>"
+        f"<i>Paid filters expire in {PAID_FILTER_DURATION} day(s). All filters are auto-triggered and also usable via /filter &lt;keyword&gt;.</i>"
     )
     await update.message.reply_html(help_text, disable_web_page_preview=True)
 
@@ -448,6 +448,58 @@ async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Filter reply type not supported.")
 
+# --- Classic Filter Bot Style: Automatic Message Handler ---
+async def message_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat or update.effective_chat.type == "private":
+        return
+    chat_id = update.effective_chat.id
+    filters_list = get_group_filters(chat_id)
+    text = update.message.text or update.message.caption
+    if not text:
+        return
+    for flt in filters_list:
+        keyword = flt['keyword']
+        reply = flt['reply']
+        regex = flt.get('regex', False)
+        silent = flt.get('silent', False)
+        # Check expiry for paid filter
+        if is_paid_filter(flt) and flt.get("expires_at") and datetime.now() > flt["expires_at"]:
+            continue
+        found = False
+        if regex:
+            try:
+                if re.search(keyword, text, re.IGNORECASE):
+                    found = True
+            except Exception:
+                continue
+        else:
+            if keyword.lower() in text.lower():
+                found = True
+        if found:
+            increment_filter_count(chat_id, keyword)
+            markup = build_markup(reply.get('buttons', []))
+            try:
+                if silent:
+                    try:
+                        await update.message.delete()
+                    except Exception:
+                        pass
+                if reply["type"] == "text":
+                    await update.message.reply_text(reply["content"], reply_markup=markup, disable_web_page_preview=True)
+                elif reply["type"] == "photo":
+                    await update.message.reply_photo(reply["file_id"], caption=reply.get("caption", ""), reply_markup=markup)
+                elif reply["type"] == "sticker":
+                    await update.message.reply_sticker(reply["file_id"])
+                elif reply["type"] == "document":
+                    await update.message.reply_document(reply["file_id"], caption=reply.get("caption", ""), reply_markup=markup)
+                elif reply["type"] == "video":
+                    await update.message.reply_video(reply["file_id"], caption=reply.get("caption", ""), reply_markup=markup)
+                else:
+                    await update.message.reply_text("Filter reply type not supported.")
+            except Exception as e:
+                logger.error(f"Error sending filter reply: {e}")
+            break
+
 # --- Background job to remove expired paid filters ---
 async def remove_expired_paid_filters(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now()
@@ -479,6 +531,7 @@ def main():
     app.add_handler(CommandHandler("setsilent", setsilent_cmd))
     app.add_handler(CommandHandler("filter", filter_cmd))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_payment_screenshot))
+    app.add_handler(MessageHandler(filters.ALL, message_filter_handler))
     app.job_queue.run_repeating(remove_expired_paid_filters, interval=3600, first=10)
     print(f"{BOT_DISPLAY_NAME} started.")
     app.run_polling()
