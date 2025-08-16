@@ -13,7 +13,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 # --- CONFIGURATION ---
-BOT_TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', 'Y')
 MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb+srv://worep38024:eQkzkfjayr6cVtkI@cluster0.mtradfw.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
 DB_NAME = os.environ.get('MONGO_DB_NAME', 'filterbot')
 BOT_OWNER_ID = 6797820880  # <--- PUT YOUR TELEGRAM USER ID HERE!
@@ -119,17 +119,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         f"<b>{BOT_DISPLAY_NAME} Commands:</b>\n"
-        "<b>/addfilter &lt;keyword&gt; &lt;reply&gt;</b> - Admins add filters for free. Members can buy a filter.\n"
+        "<b>To add a filter:</b>\n"
+        "1. Send the reply message you want to save (text, photo, sticker, etc.).\n"
+        "2. Reply to that message with <code>/addfilter keyword1 keyword2 ...</code> (multiple keywords allowed).\n"
         "<b>/removefilter &lt;keyword&gt;</b> - Remove filter (admins or owner for paid)\n"
-        "<b>/editfilter &lt;keyword&gt;</b> - Edit filter (admins or owner for paid)\n"
+        "<b>/editfilter &lt;keyword&gt;</b> - Edit filter (admins or owner for paid, reply to new message)\n"
         "<b>/filter &lt;keyword&gt;</b> - Show a filter's reply\n"
         "<b>/listfilters</b> - List all filters\n"
         "<b>/filterstats &lt;keyword&gt;</b> - Show trigger count\n"
         "<b>/approvefilter &lt;keyword&gt;</b> - (owner only, reply to payment screenshot)\n"
         "<b>/setregex &lt;keyword&gt; on/off</b> - Regex (admins or owner for paid)\n"
         "<b>/setsilent &lt;keyword&gt; on/off</b> - Silent mode (admins or owner for paid)\n"
-        "<b>/enablefilters</b> - Enable filtering in group\n"
-        "<b>/disablefilters</b> - Disable filtering in group\n"
         "<b>/help</b> - Show this help\n\n"
         f"<i>Paid filters expire in {PAID_FILTER_DURATION} day(s). All filters are used via /filter &lt;keyword&gt; only.</i>"
     )
@@ -140,40 +140,68 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def addfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat or update.effective_chat.type == "private":
         return
+
     user_id = update.effective_user.id
     admins = await context.bot.get_chat_administrators(update.effective_chat.id)
     args = context.args
-    if not args or len(args) < 2:
-        await update.message.reply_text("Usage: /addfilter <keyword> <reply>")
+
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "❗️ You must reply to the message you want to save as the filter reply.\n"
+            "Usage: Reply to a message, then send /addfilter <keyword1> <keyword2> ..."
+        )
         return
-    keyword = args[0].lower()
-    reply_text = " ".join(args[1:]).strip()
-    pure_text, buttons = parse_buttons(reply_text)
-    reply = {"type": "text", "content": pure_text, "buttons": buttons}
+    if not args:
+        await update.message.reply_text("Usage: Reply to a message, then send /addfilter <keyword1> <keyword2> ...")
+        return
+
+    keywords = [kw.lower() for kw in args]
+    reply_msg = update.message.reply_to_message
+
+    # Parse reply content
+    if reply_msg.text:
+        pure_text, buttons = parse_buttons(reply_msg.text)
+        reply = {"type": "text", "content": pure_text, "buttons": buttons}
+    elif reply_msg.photo:
+        reply = {"type": "photo", "file_id": reply_msg.photo[-1].file_id, "caption": reply_msg.caption or "", "buttons":[]}
+    elif reply_msg.video:
+        reply = {"type": "video", "file_id": reply_msg.video.file_id, "caption": reply_msg.caption or "", "buttons":[]}
+    elif reply_msg.sticker:
+        reply = {"type": "sticker", "file_id": reply_msg.sticker.file_id, "buttons":[]}
+    elif reply_msg.document:
+        reply = {"type": "document", "file_id": reply_msg.document.file_id, "caption": reply_msg.caption or "", "buttons":[]}
+    else:
+        await update.message.reply_text("Unsupported media for filter.")
+        return
 
     if is_admin(user_id, admins):
-        add_filter(update.effective_chat.id, keyword, reply)
-        await update.message.reply_text(f"Filter <b>{html.escape(keyword)}</b> added!", parse_mode=ParseMode.HTML)
+        for keyword in keywords:
+            add_filter(update.effective_chat.id, keyword, reply)
+        await update.message.reply_text(
+            f"Filter(s) <b>{', '.join(html.escape(k) for k in keywords)}</b> added!",
+            parse_mode=ParseMode.HTML
+        )
         return
 
     # Paid filter request for non-admins
-    paid_requests_col.update_one(
-        {"chat_id": update.effective_chat.id, "user_id": user_id, "keyword": keyword},
-        {"$set": {
-            "chat_id": update.effective_chat.id,
-            "user_id": user_id,
-            "username": update.effective_user.username,
-            "keyword": keyword,
-            "reply": reply,
-            "status": "pending",
-            "requested_at": datetime.now()
-        }},
-        upsert=True
-    )
+    for keyword in keywords:
+        paid_requests_col.update_one(
+            {"chat_id": update.effective_chat.id, "user_id": user_id, "keyword": keyword},
+            {"$set": {
+                "chat_id": update.effective_chat.id,
+                "user_id": user_id,
+                "username": update.effective_user.username,
+                "keyword": keyword,
+                "reply": reply,
+                "status": "pending",
+                "requested_at": datetime.now()
+            }},
+            upsert=True
+        )
     price_text = (
-        f"To add your own filter, please pay ₹{PAID_FILTER_PRICE} via UPI to <code>{UPI_ID}</code> "
+        f"To add your filter(s), please pay ₹{PAID_FILTER_PRICE} via UPI to <code>{UPI_ID}</code> "
         "and send your payment screenshot here (in group or private chat). "
-        "The bot owner will approve your filter!"
+        "The bot owner will approve your filter(s)!"
     )
     await update.message.reply_html(price_text)
 
@@ -409,7 +437,16 @@ async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     markup = build_markup(reply.get('buttons', []))
     if reply["type"] == "text":
         await update.message.reply_text(reply["content"], reply_markup=markup, disable_web_page_preview=True)
-    # Add media support if you want
+    elif reply["type"] == "photo":
+        await update.message.reply_photo(reply["file_id"], caption=reply.get("caption", ""), reply_markup=markup)
+    elif reply["type"] == "sticker":
+        await update.message.reply_sticker(reply["file_id"])
+    elif reply["type"] == "document":
+        await update.message.reply_document(reply["file_id"], caption=reply.get("caption", ""), reply_markup=markup)
+    elif reply["type"] == "video":
+        await update.message.reply_video(reply["file_id"], caption=reply.get("caption", ""), reply_markup=markup)
+    else:
+        await update.message.reply_text("Filter reply type not supported.")
 
 # --- Background job to remove expired paid filters ---
 async def remove_expired_paid_filters(context: ContextTypes.DEFAULT_TYPE):
