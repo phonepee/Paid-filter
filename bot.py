@@ -38,6 +38,7 @@ def get_filter(chat_id: int, keyword: str):
     return filters_col.find_one({"chat_id": chat_id, "keyword": keyword})
 
 def add_filter(chat_id: int, keyword: str, reply: dict, regex=False, silent=False):
+    # Always save as dict
     filters_col.update_one(
         {"chat_id": chat_id, "keyword": keyword},
         {"$set": {
@@ -377,6 +378,11 @@ async def message_filter_handler(update: Update, context: ContextTypes.DEFAULT_T
     for f in filters_list:
         keyword = f['keyword']
         reply = f['reply']
+        # ---- Fix: check reply is dict ----
+        if not isinstance(reply, dict):
+            logger.error(f"Filter reply is not a dict: {reply}")
+            continue  # skip this filter
+
         regex = f.get('regex', False)
         silent = f.get('silent', False)
         found = False
