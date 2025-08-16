@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# --- CONFIGURE THESE! ---
+# --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb+srv://worep38024:eQkzkfjayr6cVtkI@cluster0.mtradfw.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
 DB_NAME = os.environ.get('MONGO_DB_NAME', 'filterbot')
@@ -60,9 +60,9 @@ def add_filter(chat_id: int, keyword: str, reply: dict, regex=False, silent=Fals
             "regex": regex,
             "silent": silent,
             "count": 0,
-            "paid_by": paid_by,  # Telegram user_id if paid filter else None
+            "paid_by": paid_by,
             "created_at": datetime.now(),
-            "expires_at": expires_at  # for paid filters
+            "expires_at": expires_at
         }},
         upsert=True
     )
@@ -122,6 +122,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>/addfilter &lt;keyword&gt; &lt;reply&gt;</b> - Admins add filters for free. Members can buy a filter.\n"
         "<b>/removefilter &lt;keyword&gt;</b> - Remove filter (admins or owner for paid)\n"
         "<b>/editfilter &lt;keyword&gt;</b> - Edit filter (admins or owner for paid)\n"
+        "<b>/filter &lt;keyword&gt;</b> - Show a filter's reply\n"
         "<b>/listfilters</b> - List all filters\n"
         "<b>/filterstats &lt;keyword&gt;</b> - Show trigger count\n"
         "<b>/approvefilter &lt;keyword&gt;</b> - (owner only, reply to payment screenshot)\n"
@@ -130,7 +131,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>/enablefilters</b> - Enable filtering in group\n"
         "<b>/disablefilters</b> - Disable filtering in group\n"
         "<b>/help</b> - Show this help\n\n"
-        f"<i>Paid filters expire in {PAID_FILTER_DURATION} day(s).</i>"
+        f"<i>Paid filters expire in {PAID_FILTER_DURATION} day(s). All filters are used via /filter &lt;keyword&gt; only.</i>"
     )
     await update.message.reply_html(help_text, disable_web_page_preview=True)
 
@@ -387,45 +388,28 @@ async def setsilent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(f"Silent mode {'enabled' if state == 'on' else 'disabled'} for <b>{html.escape(keyword)}</b>.", parse_mode=ParseMode.HTML)
 
-# --- Message Handler for Filters ---
-
-async def message_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_chat or update.effective_chat.type == "private":
+# --- Command to trigger filter ---
+async def filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /filter <keyword>")
         return
-    chat_id = update.effective_chat.id
-    filters_list = get_group_filters(chat_id)
-    text = update.message.text or update.message.caption
-    if not text:
+    keyword = context.args[0].lower()
+    flt = get_filter(update.effective_chat.id, keyword)
+    if not flt:
+        await update.message.reply_text("No such filter.")
         return
-    for f in filters_list:
-        keyword = f['keyword']
-        reply = f['reply']
-        regex = f.get('regex', False)
-        silent = f.get('silent', False)
-        found = False
-        if regex:
-            try:
-                if re.search(keyword, text, re.IGNORECASE):
-                    found = True
-            except Exception:
-                continue
-        else:
-            if keyword.lower() in text.lower():
-                found = True
-        if found:
-            increment_filter_count(chat_id, keyword)
-            if silent:
-                try:
-                    await update.message.delete()
-                except Exception:
-                    pass
-            try:
-                markup = build_markup(reply.get('buttons', []))
-                if reply["type"] == "text":
-                    await update.message.reply_text(reply["content"], reply_markup=markup, disable_web_page_preview=True)
-            except Exception as e:
-                logger.error(f"Error sending filter reply: {e}")
-            break
+    # If paid filter, check expiry
+    if is_paid_filter(flt):
+        expires_at = flt.get("expires_at")
+        if expires_at and datetime.now() > expires_at:
+            await update.message.reply_text("This paid filter has expired.")
+            return
+    increment_filter_count(update.effective_chat.id, keyword)
+    reply = flt["reply"]
+    markup = build_markup(reply.get('buttons', []))
+    if reply["type"] == "text":
+        await update.message.reply_text(reply["content"], reply_markup=markup, disable_web_page_preview=True)
+    # Add media support if you want
 
 # --- Background job to remove expired paid filters ---
 async def remove_expired_paid_filters(context: ContextTypes.DEFAULT_TYPE):
@@ -456,8 +440,8 @@ def main():
     app.add_handler(CommandHandler("filterstats", filterstats_cmd))
     app.add_handler(CommandHandler("setregex", setregex_cmd))
     app.add_handler(CommandHandler("setsilent", setsilent_cmd))
+    app.add_handler(CommandHandler("filter", filter_cmd))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_payment_screenshot))
-    app.add_handler(MessageHandler(filters.ALL, message_filter_handler))
     app.job_queue.run_repeating(remove_expired_paid_filters, interval=3600, first=10)
     print(f"{BOT_DISPLAY_NAME} started.")
     app.run_polling()
