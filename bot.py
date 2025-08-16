@@ -2,8 +2,7 @@ import os
 import re
 import html
 import logging
-import asyncio
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta
 from pymongo import MongoClient
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,17 +12,16 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# === CONFIGURATION ===
+# --- CONFIGURE THESE! ---
 BOT_TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb+srv://worep38024:eQkzkfjayr6cVtkI@cluster0.mtradfw.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
 DB_NAME = os.environ.get('MONGO_DB_NAME', 'filterbot')
-
 BOT_OWNER_ID = 6797820880  # <--- PUT YOUR TELEGRAM USER ID HERE!
 BOT_DISPLAY_NAME = "FilterBot"
 NEWS_CHANNEL_URL = "https://t.me/Zoro_bots"
 UPI_ID = "8888888888@upi"
 PAID_FILTER_PRICE = 49  # INR
-PAID_FILTER_DURATION = 1  # days, after which filter expires
+PAID_FILTER_DURATION = 1  # days (set to your desired duration)
 
 client = MongoClient(MONGODB_URI)
 db = client[DB_NAME]
@@ -33,7 +31,10 @@ paid_requests_col = db['paid_requests']
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# === Helper Functions ===
+# --- Helpers ---
+
+def is_admin(user_id: int, chat_admins) -> bool:
+    return any(admin.user.id == user_id for admin in chat_admins)
 
 def get_group_filters(chat_id: int):
     return list(filters_col.find({"chat_id": chat_id}))
@@ -41,16 +42,27 @@ def get_group_filters(chat_id: int):
 def get_filter(chat_id: int, keyword: str):
     return filters_col.find_one({"chat_id": chat_id, "keyword": keyword})
 
-def add_filter(chat_id: int, keyword: str, reply: dict, paid_by=None, expires_at=None):
+def is_paid_filter(flt):
+    return flt.get("paid_by") is not None
+
+def filter_expiry_string(flt):
+    if is_paid_filter(flt) and flt.get("expires_at"):
+        return f" [Paid, expires: {flt['expires_at'].strftime('%Y-%m-%d %H:%M')}]"
+    return " [Paid]" if is_paid_filter(flt) else ""
+
+def add_filter(chat_id: int, keyword: str, reply: dict, regex=False, silent=False, paid_by=None, expires_at=None):
     filters_col.update_one(
         {"chat_id": chat_id, "keyword": keyword},
         {"$set": {
             "chat_id": chat_id,
             "keyword": keyword,
             "reply": reply,
+            "regex": regex,
+            "silent": silent,
             "count": 0,
-            "paid_by": paid_by,
-            "expires_at": expires_at
+            "paid_by": paid_by,  # Telegram user_id if paid filter else None
+            "created_at": datetime.now(),
+            "expires_at": expires_at  # for paid filters
         }},
         upsert=True
     )
@@ -83,31 +95,14 @@ def build_markup(buttons):
         keyboard.append(row)
     return InlineKeyboardMarkup(keyboard)
 
-async def remove_expired_paid_filters(app):
-    """Background task: remove paid filters that have expired."""
-    while True:
-        now = datetime.now()
-        expired = list(filters_col.find({"expires_at": {"$lte": now}}))
-        for flt in expired:
-            filters_col.delete_one({"_id": flt["_id"]})
-            try:
-                await app.bot.send_message(
-                    flt["chat_id"],
-                    f"Paid filter <b>{html.escape(flt['keyword'])}</b> expired and was removed.",
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception:
-                pass
-        await asyncio.sleep(3600)
-
-# === COMMAND HANDLERS ===
+# --- Start/Help ---
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"Hey there! My name is <b>{BOT_DISPLAY_NAME}</b> - I'm here to help you manage your groups!\n"
-        "Use /help to find out how to use me to my full potential.\n\n"
-        f"Join my <a href=\"{NEWS_CHANNEL_URL}\">news channel</a> to get information on all the latest updates.\n\n"
-        f"To add your own filter, pay <b>₹{PAID_FILTER_PRICE}</b> via UPI: <code>{UPI_ID}</code> and follow instructions."
+        "Use /help to see all commands.\n\n"
+        f"Join my <a href=\"{NEWS_CHANNEL_URL}\">news channel</a> for updates.\n\n"
+        f"Non-admins: To add your own filter, pay <b>₹{PAID_FILTER_PRICE}</b> via UPI: <code>{UPI_ID}</code> and follow the instructions."
     )
     keyboard = [
         [
@@ -124,19 +119,28 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         f"<b>{BOT_DISPLAY_NAME} Commands:</b>\n"
-        "<b>/addfilter &lt;keyword&gt; &lt;reply&gt;</b> - Request a paid filter (for 1 day)\n"
-        "<b>/approvefilter &lt;keyword&gt;</b> - (Owner only, reply to payment screenshot)\n"
-        "<b>/listfilters</b> - List all active filters\n"
+        "<b>/addfilter &lt;keyword&gt; &lt;reply&gt;</b> - Admins add filters for free. Members can buy a filter.\n"
+        "<b>/removefilter &lt;keyword&gt;</b> - Remove filter (admins or owner for paid)\n"
+        "<b>/editfilter &lt;keyword&gt;</b> - Edit filter (admins or owner for paid)\n"
+        "<b>/listfilters</b> - List all filters\n"
         "<b>/filterstats &lt;keyword&gt;</b> - Show trigger count\n"
+        "<b>/approvefilter &lt;keyword&gt;</b> - (owner only, reply to payment screenshot)\n"
+        "<b>/setregex &lt;keyword&gt; on/off</b> - Regex (admins or owner for paid)\n"
+        "<b>/setsilent &lt;keyword&gt; on/off</b> - Silent mode (admins or owner for paid)\n"
+        "<b>/enablefilters</b> - Enable filtering in group\n"
+        "<b>/disablefilters</b> - Disable filtering in group\n"
         "<b>/help</b> - Show this help\n\n"
-        f"<i>Only the bot owner can approve filters. Paid filters are auto-removed after 1 day</i>."
+        f"<i>Paid filters expire in {PAID_FILTER_DURATION} day(s).</i>"
     )
     await update.message.reply_html(help_text, disable_web_page_preview=True)
+
+# --- Filter commands ---
 
 async def addfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat or update.effective_chat.type == "private":
         return
     user_id = update.effective_user.id
+    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
     args = context.args
     if not args or len(args) < 2:
         await update.message.reply_text("Usage: /addfilter <keyword> <reply>")
@@ -146,7 +150,12 @@ async def addfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pure_text, buttons = parse_buttons(reply_text)
     reply = {"type": "text", "content": pure_text, "buttons": buttons}
 
-    # Store the request in DB, wait for screenshot, then owner approval
+    if is_admin(user_id, admins):
+        add_filter(update.effective_chat.id, keyword, reply)
+        await update.message.reply_text(f"Filter <b>{html.escape(keyword)}</b> added!", parse_mode=ParseMode.HTML)
+        return
+
+    # Paid filter request for non-admins
     paid_requests_col.update_one(
         {"chat_id": update.effective_chat.id, "user_id": user_id, "keyword": keyword},
         {"$set": {
@@ -163,18 +172,16 @@ async def addfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price_text = (
         f"To add your own filter, please pay ₹{PAID_FILTER_PRICE} via UPI to <code>{UPI_ID}</code> "
         "and send your payment screenshot here (in group or private chat). "
-        "The bot owner will approve your filter and it will be active for 1 day from approval!"
+        "The bot owner will approve your filter!"
     )
     await update.message.reply_html(price_text)
 
 async def handle_payment_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only act if it's a media message (photo/document) and the sender has a pending paid filter
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     req = paid_requests_col.find_one({"user_id": user_id, "chat_id": chat_id, "status": "pending"})
     if not req:
-        return  # No pending filter request from this user in this group
-    # Attach the screenshot file info to their request for owner review
+        return
     file_id = None
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
@@ -190,7 +197,6 @@ async def handle_payment_screenshot(update: Update, context: ContextTypes.DEFAUL
         )
 
 async def approvefilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only bot owner can approve paid filters
     if update.effective_user.id != BOT_OWNER_ID:
         await update.message.reply_text("Only the bot owner can approve paid filters.")
         return
@@ -214,23 +220,94 @@ async def approvefilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not req:
         await update.message.reply_text("No matching pending paid filter request found for this user and keyword.")
         return
-    # Approve: add filter, set expiration, notify user
-    expires_at = datetime.combine((datetime.now() + timedelta(days=PAID_FILTER_DURATION)).date(), dt_time.min)
+
+    expires_at = datetime.now() + timedelta(days=PAID_FILTER_DURATION)
     add_filter(chat_id, keyword, req["reply"], paid_by=user_id, expires_at=expires_at)
     paid_requests_col.update_one({"_id": req["_id"]}, {"$set": {"status": "approved", "approved_at": datetime.now(), "expires_at": expires_at}})
     await update.message.reply_text(
-        f"Paid filter <b>{html.escape(keyword)}</b> approved! It will be active for 1 day and auto-remove at midnight.",
+        f"Paid filter <b>{html.escape(keyword)}</b> approved! It will expire in {PAID_FILTER_DURATION} day(s).",
         parse_mode=ParseMode.HTML
     )
     try:
-        # Notify the user in private
         await context.bot.send_message(
             user_id,
-            f"Your paid filter '<b>{html.escape(keyword)}</b>' is now active in group <b>{update.effective_chat.title}</b> for 1 day!",
+            f"Your paid filter '<b>{html.escape(keyword)}</b>' is now active in group <b>{update.effective_chat.title}</b> for {PAID_FILTER_DURATION} day(s)!",
             parse_mode=ParseMode.HTML
         )
     except Exception:
         pass
+
+async def removefilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat or update.effective_chat.type == "private":
+        return
+    user_id = update.effective_user.id
+    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /removefilter <keyword>")
+        return
+    keyword = args[0].lower()
+    flt = get_filter(update.effective_chat.id, keyword)
+    if not flt:
+        await update.message.reply_text("No such filter.")
+        return
+    if is_paid_filter(flt):
+        if user_id != BOT_OWNER_ID:
+            await update.message.reply_text("Only the bot owner can remove paid filters.")
+            return
+    else:
+        if not is_admin(user_id, admins):
+            await update.message.reply_text("Only admins can remove filters.")
+            return
+    result = remove_filter(update.effective_chat.id, keyword)
+    if result.deleted_count:
+        await update.message.reply_text(f"Filter <b>{html.escape(keyword)}</b> removed.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text("No such filter.")
+
+async def editfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat or update.effective_chat.type == "private":
+        return
+    user_id = update.effective_user.id
+    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /editfilter <keyword> (reply to new content)")
+        return
+    keyword = args[0].lower()
+    flt = get_filter(update.effective_chat.id, keyword)
+    if not flt:
+        await update.message.reply_text("No such filter.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the new content for the filter.")
+        return
+    reply_msg = update.message.reply_to_message
+    reply = None
+    if reply_msg.text:
+        pure_text, buttons = parse_buttons(reply_msg.text)
+        reply = {"type": "text", "content": pure_text, "buttons": buttons}
+    elif reply_msg.photo:
+        reply = {"type": "photo", "file_id": reply_msg.photo[-1].file_id, "caption": reply_msg.caption or "", "buttons":[]}
+    elif reply_msg.video:
+        reply = {"type": "video", "file_id": reply_msg.video.file_id, "caption": reply_msg.caption or "", "buttons":[]}
+    elif reply_msg.sticker:
+        reply = {"type": "sticker", "file_id": reply_msg.sticker.file_id, "buttons":[]}
+    elif reply_msg.document:
+        reply = {"type": "document", "file_id": reply_msg.document.file_id, "caption": reply_msg.caption or "", "buttons":[]}
+    else:
+        await update.message.reply_text("Unsupported media for filter.")
+        return
+    if is_paid_filter(flt):
+        if user_id != BOT_OWNER_ID:
+            await update.message.reply_text("Only the bot owner can edit paid filters.")
+            return
+    else:
+        if not is_admin(user_id, admins):
+            await update.message.reply_text("Only admins can edit filters.")
+            return
+    add_filter(update.effective_chat.id, keyword, reply)
+    await update.message.reply_text(f"Filter <b>{html.escape(keyword)}</b> edited.", parse_mode=ParseMode.HTML)
 
 async def listfilters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -238,9 +315,9 @@ async def listfilters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not filters_list:
         await update.message.reply_text("No filters set in this group.")
         return
-
     text = "<b>Filters in this group:</b>\n" + "\n".join(
-        f"• <code>{html.escape(f['keyword'])}</code>" for f in filters_list
+        f"• <code>{html.escape(f['keyword'])}</code>{filter_expiry_string(f)}"
+        for f in filters_list
     )
     await update.message.reply_html(text)
 
@@ -256,7 +333,61 @@ async def filterstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(f"Filter <b>{html.escape(keyword)}</b> triggered <b>{flt.get('count',0)}</b> times.", parse_mode=ParseMode.HTML)
 
-# === FILTER TRIGGER HANDLER ===
+# --- Regex and Silent features ---
+
+async def setregex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
+    args = context.args
+    if len(args) != 2 or args[1] not in ['on', 'off']:
+        await update.message.reply_text("Usage: /setregex <keyword> on/off")
+        return
+    keyword, state = args[0].lower(), args[1]
+    flt = get_filter(update.effective_chat.id, keyword)
+    if not flt:
+        await update.message.reply_text("No such filter.")
+        return
+    if is_paid_filter(flt):
+        if user_id != BOT_OWNER_ID:
+            await update.message.reply_text("Only the bot owner can set regex for paid filters.")
+            return
+    else:
+        if not is_admin(user_id, admins):
+            await update.message.reply_text("Only admins can set regex.")
+            return
+    filters_col.update_one(
+        {"chat_id": update.effective_chat.id, "keyword": keyword},
+        {"$set": {"regex": state == 'on'}}
+    )
+    await update.message.reply_text(f"Regex {'enabled' if state == 'on' else 'disabled'} for <b>{html.escape(keyword)}</b>.", parse_mode=ParseMode.HTML)
+
+async def setsilent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
+    args = context.args
+    if len(args) != 2 or args[1] not in ['on', 'off']:
+        await update.message.reply_text("Usage: /setsilent <keyword> on/off")
+        return
+    keyword, state = args[0].lower(), args[1]
+    flt = get_filter(update.effective_chat.id, keyword)
+    if not flt:
+        await update.message.reply_text("No such filter.")
+        return
+    if is_paid_filter(flt):
+        if user_id != BOT_OWNER_ID:
+            await update.message.reply_text("Only the bot owner can set silent mode for paid filters.")
+            return
+    else:
+        if not is_admin(user_id, admins):
+            await update.message.reply_text("Only admins can set silent mode.")
+            return
+    filters_col.update_one(
+        {"chat_id": update.effective_chat.id, "keyword": keyword},
+        {"$set": {"silent": state == 'on'}}
+    )
+    await update.message.reply_text(f"Silent mode {'enabled' if state == 'on' else 'disabled'} for <b>{html.escape(keyword)}</b>.", parse_mode=ParseMode.HTML)
+
+# --- Message Handler for Filters ---
 
 async def message_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat or update.effective_chat.type == "private":
@@ -269,11 +400,25 @@ async def message_filter_handler(update: Update, context: ContextTypes.DEFAULT_T
     for f in filters_list:
         keyword = f['keyword']
         reply = f['reply']
+        regex = f.get('regex', False)
+        silent = f.get('silent', False)
         found = False
-        if keyword.lower() in text.lower():
-            found = True
+        if regex:
+            try:
+                if re.search(keyword, text, re.IGNORECASE):
+                    found = True
+            except Exception:
+                continue
+        else:
+            if keyword.lower() in text.lower():
+                found = True
         if found:
             increment_filter_count(chat_id, keyword)
+            if silent:
+                try:
+                    await update.message.delete()
+                except Exception:
+                    pass
             try:
                 markup = build_markup(reply.get('buttons', []))
                 if reply["type"] == "text":
@@ -282,25 +427,39 @@ async def message_filter_handler(update: Update, context: ContextTypes.DEFAULT_T
                 logger.error(f"Error sending filter reply: {e}")
             break
 
-# === MAIN APP ===
+# --- Background job to remove expired paid filters ---
+async def remove_expired_paid_filters(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now()
+    expired = list(filters_col.find({"expires_at": {"$lte": now}}))
+    for flt in expired:
+        filters_col.delete_one({"_id": flt["_id"]})
+        try:
+            await context.bot.send_message(
+                flt["chat_id"],
+                f"Paid filter <b>{html.escape(flt['keyword'])}</b> expired and was removed.",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
+# --- MAIN APP ---
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("addfilter", addfilter_cmd))
     app.add_handler(CommandHandler("approvefilter", approvefilter_cmd))
+    app.add_handler(CommandHandler("removefilter", removefilter_cmd))
+    app.add_handler(CommandHandler("editfilter", editfilter_cmd))
     app.add_handler(CommandHandler("listfilters", listfilters_cmd))
     app.add_handler(CommandHandler("filterstats", filterstats_cmd))
+    app.add_handler(CommandHandler("setregex", setregex_cmd))
+    app.add_handler(CommandHandler("setsilent", setsilent_cmd))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_payment_screenshot))
     app.add_handler(MessageHandler(filters.ALL, message_filter_handler))
-
-    # Start background task for filter expiry
-    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(remove_expired_paid_filters(app)), interval=3600, first=0)
-
+    app.job_queue.run_repeating(remove_expired_paid_filters, interval=3600, first=10)
     print(f"{BOT_DISPLAY_NAME} started.")
     app.run_polling()
-
 if __name__ == "__main__":
     main()
